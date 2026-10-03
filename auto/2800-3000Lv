@@ -62,7 +62,7 @@ local SETTINGS_DIR = "YELU0_Kaitun"
 local SETTINGS_FILE = SETTINGS_DIR .. "/settings_" .. tostring(localPlayer.UserId) .. ".json"
 local SELF_FILE = "YELU0_Secret_Kaitun.lua"
 local AUTO_EXEC_FILE = SETTINGS_DIR .. "/AutoKaitun.file"
-local KAITUN_LOADER_URL = "https://rjr-loader.top/script/kaitun2800-3000"
+local KAITUN_LOADER_URL = "https://raw.githubusercontent.com/nAS87AA78/mzher-hub/refs/heads/main/auto/2800-3000Lv"
 local autoExecSetFile
 
 local Settings = {
