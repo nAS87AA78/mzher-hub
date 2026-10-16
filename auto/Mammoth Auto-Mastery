@@ -15,8 +15,15 @@ local FarmEnabled = false
 local UIVisible = true
 local FlySpeed = 220
 local LowHPRatio = 0.20
-local HoverDistanceUp = 16
-local HoverDistanceBack = 5
+
+-- 環繞避招與高度穩定參數
+local OrbitRadius = 14
+local OrbitSpeed = 2.4
+local OrbitAngle = 0
+local BaseHoverHeight = 15
+local BobbingSpeed = 3.2
+local BobbingAmp = 4
+local DodgeAltitude = 0
 
 local CakeMobs = {
     ["Cookie Crafter"] = true,
@@ -36,10 +43,14 @@ local patrolIndex = 1
 local currentTarget = nil
 local clusterAnchor = nil
 local currentEquippedType = ""
+local equipCooldown = 0
 local lastSkillTick = 0
 local lastAttackTick = 0
 local lastBringTick = 0
-local skillCycle = {Enum.KeyCode.Z, Enum.KeyCode.X, Enum.KeyCode.C, Enum.KeyCode.V, Enum.KeyCode.F}
+local lastHealthRecorded = 0
+
+-- 移除 V 技能（完全不釋放變身），只保留 Z、X、C、F
+local skillCycle = {Enum.KeyCode.Z, Enum.KeyCode.X, Enum.KeyCode.C, Enum.KeyCode.F}
 local skillIndex = 1
 
 local bv, bg, farmLoop, noclipLoop, attackLoop, rainbowConn, charAddedConn, keyConn
@@ -58,7 +69,10 @@ local function EnableBuso()
     pcall(function()
         local char = LocalPlayer.Character
         if char and not char:FindFirstChild("HasBuso") then
-            ReplicatedStorage.Remotes.CommF_:InvokeServer("Buso")
+            local comm = ReplicatedStorage:FindFirstChild("Remotes") and ReplicatedStorage.Remotes:FindFirstChild("CommF_")
+            if comm then
+                comm:InvokeServer("Buso")
+            end
         end
     end)
 end
@@ -91,7 +105,7 @@ local function FindTool(toolType, fallbackKeyword)
 end
 
 local function SmartEquip(toolType, fallbackKeyword)
-    if currentEquippedType == toolType then return end
+    if currentEquippedType == toolType and tick() - equipCooldown < 0.25 then return end
     local char = LocalPlayer.Character
     if not char then return end
     local hum = char:FindFirstChildOfClass("Humanoid")
@@ -102,6 +116,7 @@ local function SmartEquip(toolType, fallbackKeyword)
         pcall(function()
             hum:EquipTool(tool)
             currentEquippedType = toolType
+            equipCooldown = tick()
         end)
     elseif tool and tool.Parent == char then
         currentEquippedType = toolType
@@ -173,8 +188,27 @@ local function SelectTarget()
     return currentTarget
 end
 
+local function IsMobCastingSkill(mob)
+    if not mob then return false end
+    local hum = mob:FindFirstChildOfClass("Humanoid")
+    if not hum then return false end
+
+    local animator = hum:FindFirstChildOfClass("Animator")
+    if animator then
+        for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+            local trackName = track.Name:lower()
+            if track.IsPlaying and track.Speed > 0 then
+                if not trackName:find("idle") and not trackName:find("walk") and not trackName:find("run") then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
 local function BringSurroundingMobs(anchorPos)
-    if not anchorPos or tick() - lastBringTick < 0.15 then return end
+    if not anchorPos or tick() - lastBringTick < 0.18 then return end
     lastBringTick = tick()
     SafeSetSimRadius()
 
@@ -191,12 +225,6 @@ local function BringSurroundingMobs(anchorPos)
                             child:Destroy()
                         end
                     end
-                    local animator = hum:FindFirstChildOfClass("Animator")
-                    if animator then
-                        for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
-                            track:Stop()
-                        end
-                    end
                     hum.WalkSpeed = 0
                     hum.JumpPower = 0
                     hum.AutoRotate = false
@@ -211,17 +239,22 @@ local function BringSurroundingMobs(anchorPos)
     end
 end
 
-local function StandardAutoClick()
+local function GuaranteedMeleeAttack(targetMob)
+    local char = LocalPlayer.Character
+    if not char then return end
+    local myRoot = char:FindFirstChild("HumanoidRootPart")
+    if not myRoot then return end
+
+    local currentTool = char:FindFirstChildOfClass("Tool")
+    if not currentTool or currentTool.ToolTip ~= "Melee" then
+        return
+    end
+
+    currentTool:Activate()
+
     pcall(function()
         VirtualUser:CaptureController()
-        VirtualUser:Button1Down(Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2))
-        local char = LocalPlayer.Character
-        if char then
-            local tool = char:FindFirstChildOfClass("Tool")
-            if tool then
-                tool:Activate()
-            end
-        end
+        VirtualUser:ClickButton1(Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2))
     end)
 
     pcall(function()
@@ -229,12 +262,22 @@ local function StandardAutoClick()
         if net then
             local regAtk = net:FindFirstChild("RE/RegisterAttack")
             local regHit = net:FindFirstChild("RE/RegisterHit")
-            if regAtk and regHit and currentTarget then
-                local troot = currentTarget:FindFirstChild("HumanoidRootPart")
-                local thead = currentTarget:FindFirstChild("Head") or troot
-                if troot then
-                    regAtk:FireServer(0)
-                    regHit:FireServer(thead, {{currentTarget, thead}})
+            if regAtk and regHit and targetMob then
+                local troot = targetMob:FindFirstChild("HumanoidRootPart")
+                local thead = targetMob:FindFirstChild("Head") or troot
+                if troot and (troot.Position - myRoot.Position).Magnitude <= 80 then
+                    local hitBatch = {}
+                    for _, mob in ipairs(GetAliveCakeMobs()) do
+                        local mr = mob:FindFirstChild("HumanoidRootPart")
+                        local mh = mob:FindFirstChild("Head") or mr
+                        if mr and (mr.Position - myRoot.Position).Magnitude <= 80 then
+                            table.insert(hitBatch, {mob, mh})
+                        end
+                    end
+                    if #hitBatch > 0 then
+                        regAtk:FireServer(0)
+                        regHit:FireServer(thead, hitBatch)
+                    end
                 end
             end
         end
@@ -250,14 +293,14 @@ local function InitFlight(root)
     CleanFlight()
     bv = Instance.new("BodyVelocity")
     bv.Name = "MzherStableBV"
-    bv.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+    bv.MaxForce = Vector3.new(1e8, 1e8, 1e8)
     bv.Velocity = Vector3.zero
     bv.Parent = root
 
     bg = Instance.new("BodyGyro")
     bg.Name = "MzherStableBG"
-    bg.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
-    bg.P = 4e4
+    bg.MaxTorque = Vector3.new(1e8, 1e8, 1e8)
+    bg.P = 5e4
     bg.D = 1200
     bg.CFrame = root.CFrame
     bg.Parent = root
@@ -280,10 +323,10 @@ local function MoveUprightStable(root, targetPos, lookAtPos)
     end
 
     local flatForward = Vector3.new(lookAtPos.X - root.Position.X, 0, lookAtPos.Z - root.Position.Z)
-    if flatForward.Magnitude > 0.1 then
+    if flatForward.Magnitude > 0.2 then
         bg.CFrame = CFrame.lookAt(root.Position, root.Position + flatForward.Unit, Vector3.new(0, 1, 0))
     else
-        bg.CFrame = CFrame.new(root.Position, root.Position + root.CFrame.LookVector)
+        bg.CFrame = CFrame.new(root.Position, root.Position + Vector3.new(root.CFrame.LookVector.X, 0, root.CFrame.LookVector.Z).Unit)
     end
 end
 
@@ -316,6 +359,7 @@ local function StopFarm()
     currentEquippedType = ""
     currentTarget = nil
     clusterAnchor = nil
+    DodgeAltitude = 0
 
     if toggleBtn and toggleBtn.Parent then
         toggleBtn.Text = "開始刷精通"
@@ -339,6 +383,8 @@ local function StartFarm()
 
     FarmEnabled = true
     currentEquippedType = ""
+    lastHealthRecorded = hum.Health
+    DodgeAltitude = 0
     InitFlight(root)
 
     if toggleBtn and toggleBtn.Parent then
@@ -378,13 +424,13 @@ local function StartFarm()
 
         if ratio > LowHPRatio then
             SmartEquip("Melee", nil)
-            if tick() - lastAttackTick >= 0.22 then
+            if tick() - lastAttackTick >= 0.18 then
                 lastAttackTick = tick()
-                StandardAutoClick()
+                GuaranteedMeleeAttack(target)
             end
         else
             SmartEquip("Blox Fruit", "Mammoth")
-            if tick() - lastSkillTick >= 0.45 then
+            if tick() - lastSkillTick >= 0.42 then
                 lastSkillTick = tick()
                 Camera.CFrame = CFrame.lookAt(Camera.CFrame.Position, mRoot.Position)
                 SendKeyDirect(skillCycle[skillIndex])
@@ -393,7 +439,7 @@ local function StartFarm()
         end
     end)
 
-    farmLoop = RunService.RenderStepped:Connect(function()
+    farmLoop = RunService.RenderStepped:Connect(function(dt)
         if not FarmEnabled then return end
         local c = LocalPlayer.Character
         if not c then return end
@@ -411,22 +457,57 @@ local function StartFarm()
                 local anchor = clusterAnchor or mRoot.Position
                 BringSurroundingMobs(anchor)
 
-                local ratio = mHum.Health / math.max(mHum.MaxHealth, 1)
-                local safeHoverPos = anchor + Vector3.new(0, HoverDistanceUp, HoverDistanceBack)
+                local mobSkill = IsMobCastingSkill(target)
+                local tookDamage = myHum.Health < lastHealthRecorded
+                lastHealthRecorded = myHum.Health
 
-                if statusLabel then
-                    if ratio > LowHPRatio then
-                        statusLabel.Text = string.format("狀態: 聚怪拳法穩定削血 (%d%%)", math.floor(ratio * 100))
-                    else
-                        statusLabel.Text = string.format("狀態: 果實精準釋放技能 (%d%%)", math.floor(ratio * 100))
+                if mobSkill or tookDamage then
+                    DodgeAltitude = 16
+                else
+                    DodgeAltitude = math.max(0, DodgeAltitude - (12 * dt))
+                end
+
+                OrbitAngle = (OrbitAngle + dt * OrbitSpeed) % (math.pi * 2)
+                local offsetX = math.cos(OrbitAngle) * OrbitRadius
+                local offsetZ = math.sin(OrbitAngle) * OrbitRadius
+
+                local floatY = BaseHoverHeight + (math.sin(tick() * BobbingSpeed) * BobbingAmp) + DodgeAltitude
+                local targetHoverPos = anchor + Vector3.new(offsetX, floatY, offsetZ)
+
+                local rayParams = RaycastParams.new()
+                rayParams.FilterDescendantsInstances = {c, workspace:FindFirstChild("Enemies")}
+                rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+                local floorHit = workspace:Raycast(targetHoverPos, Vector3.new(0, -35, 0), rayParams)
+                if floorHit then
+                    local safeFloorY = floorHit.Position.Y + 13
+                    if targetHoverPos.Y < safeFloorY then
+                        targetHoverPos = Vector3.new(targetHoverPos.X, safeFloorY, targetHoverPos.Z)
                     end
                 end
 
-                MoveUprightStable(myRoot, safeHoverPos, anchor)
+                local ratio = mHum.Health / math.max(mHum.MaxHealth, 1)
+
+                if ratio <= LowHPRatio then
+                    Camera.CFrame = CFrame.lookAt(Camera.CFrame.Position, mRoot.Position)
+                    if statusLabel then
+                        statusLabel.Text = string.format("狀態: 猛獁象 ZXCF 技能尾刀 (%d%%)", math.floor(ratio * 100))
+                    end
+                else
+                    if statusLabel then
+                        if DodgeAltitude > 2 then
+                            statusLabel.Text = string.format("狀態: 迴旋避開技能中 (%d%%)", math.floor(ratio * 100))
+                        else
+                            statusLabel.Text = string.format("狀態: 環形懸停拳法削血 (%d%%)", math.floor(ratio * 100))
+                        end
+                    end
+                end
+
+                MoveUprightStable(myRoot, targetHoverPos, anchor)
             end
         else
             if statusLabel then
-                statusLabel.Text = "狀態: 巡邏尋找蛋糕島小怪..."
+                statusLabel.Text = "狀態: 巡邏尋找蛋糕島怪物..."
             end
             local pt = CakePatrolPoints[patrolIndex]
             MoveUprightStable(myRoot, pt, pt + Vector3.new(0, 0, 10))
@@ -441,6 +522,7 @@ charAddedConn = LocalPlayer.CharacterAdded:Connect(function(newChar)
     currentTarget = nil
     clusterAnchor = nil
     currentEquippedType = ""
+    DodgeAltitude = 0
     newChar:WaitForChild("HumanoidRootPart", 15)
     newChar:WaitForChild("Humanoid", 15)
     task.wait(0.6)
@@ -630,7 +712,7 @@ local function BuildUI()
     noteLabel.TextColor3 = Color3.fromRGB(130, 130, 150)
     noteLabel.TextSize = 11
     noteLabel.Font = Enum.Font.GothamBold
-    noteLabel.Text = "安全懸停 | 正立防顛倒 | 聚怪尾刀"
+    noteLabel.Text = "無V變身 | 安全環形避傷 | ZXCF精準尾刀"
     noteLabel.TextXAlignment = Enum.TextXAlignment.Left
     noteLabel.Parent = mainFrame
 end
