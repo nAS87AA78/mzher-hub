@@ -1,0 +1,638 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local VirtualUser = game:GetService("VirtualUser")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local LocalPlayer = Players.LocalPlayer
+local Camera = workspace.CurrentCamera
+
+local VirtualInputManager = nil
+pcall(function()
+    VirtualInputManager = game:GetService("VirtualInputManager")
+end)
+
+local FarmEnabled = false
+local UIVisible = true
+local FlySpeed = 220
+local LowHPRatio = 0.20
+local HoverDistanceUp = 16
+local HoverDistanceBack = 5
+
+local CakeMobs = {
+    ["Cookie Crafter"] = true,
+    ["Cake Guard"] = true,
+    ["Baking Staff"] = true,
+    ["Head Baker"] = true
+}
+
+local CakePatrolPoints = {
+    Vector3.new(-1945, 65, -12320),
+    Vector3.new(-1580, 65, -12180),
+    Vector3.new(-1820, 65, -11650),
+    Vector3.new(-2150, 65, -11850)
+}
+local patrolIndex = 1
+
+local currentTarget = nil
+local clusterAnchor = nil
+local currentEquippedType = ""
+local lastSkillTick = 0
+local lastAttackTick = 0
+local lastBringTick = 0
+local skillCycle = {Enum.KeyCode.Z, Enum.KeyCode.X, Enum.KeyCode.C, Enum.KeyCode.V, Enum.KeyCode.F}
+local skillIndex = 1
+
+local bv, bg, farmLoop, noclipLoop, attackLoop, rainbowConn, charAddedConn, keyConn
+local screenGui, mainFrame, toggleBtn, hpBox, statusLabel, mFloatBtn, uiStroke
+
+local function SafeSetSimRadius()
+    pcall(function()
+        if sethiddenproperty then
+            sethiddenproperty(LocalPlayer, "SimulationRadius", math.huge)
+            sethiddenproperty(LocalPlayer, "MaxSimulationRadius", math.huge)
+        end
+    end)
+end
+
+local function EnableBuso()
+    pcall(function()
+        local char = LocalPlayer.Character
+        if char and not char:FindFirstChild("HasBuso") then
+            ReplicatedStorage.Remotes.CommF_:InvokeServer("Buso")
+        end
+    end)
+end
+
+local function FindTool(toolType, fallbackKeyword)
+    local char = LocalPlayer.Character
+    local bp = LocalPlayer:FindFirstChild("Backpack")
+
+    if char then
+        for _, item in ipairs(char:GetChildren()) do
+            if item:IsA("Tool") then
+                if item.ToolTip == toolType or (fallbackKeyword and item.Name:lower():find(fallbackKeyword:lower())) then
+                    return item
+                end
+            end
+        end
+    end
+
+    if bp then
+        for _, item in ipairs(bp:GetChildren()) do
+            if item:IsA("Tool") then
+                if item.ToolTip == toolType or (fallbackKeyword and item.Name:lower():find(fallbackKeyword:lower())) then
+                    return item
+                end
+            end
+        end
+    end
+
+    return nil
+end
+
+local function SmartEquip(toolType, fallbackKeyword)
+    if currentEquippedType == toolType then return end
+    local char = LocalPlayer.Character
+    if not char then return end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hum then return end
+
+    local tool = FindTool(toolType, fallbackKeyword)
+    if tool and tool.Parent ~= char then
+        pcall(function()
+            hum:EquipTool(tool)
+            currentEquippedType = toolType
+        end)
+    elseif tool and tool.Parent == char then
+        currentEquippedType = toolType
+    end
+end
+
+local function SendKeyDirect(keyCode)
+    pcall(function()
+        if VirtualInputManager then
+            VirtualInputManager:SendKeyEvent(true, keyCode, false, game)
+            task.wait(0.06)
+            VirtualInputManager:SendKeyEvent(false, keyCode, false, game)
+        end
+    end)
+end
+
+local function GetAliveCakeMobs()
+    local mobs = {}
+    local enemiesFolder = workspace:FindFirstChild("Enemies")
+    local source = enemiesFolder and enemiesFolder:GetChildren() or workspace:GetChildren()
+
+    for _, mob in ipairs(source) do
+        if mob:IsA("Model") and CakeMobs[mob.Name] then
+            local hum = mob:FindFirstChildOfClass("Humanoid")
+            local root = mob:FindFirstChild("HumanoidRootPart")
+            if hum and root and hum.Health > 0 then
+                table.insert(mobs, mob)
+            end
+        end
+    end
+    return mobs
+end
+
+local function SelectTarget()
+    local char = LocalPlayer.Character
+    local myRoot = char and char:FindFirstChild("HumanoidRootPart")
+    if not myRoot then return nil end
+
+    if currentTarget and currentTarget.Parent then
+        local thum = currentTarget:FindFirstChildOfClass("Humanoid")
+        local troot = currentTarget:FindFirstChild("HumanoidRootPart")
+        if thum and troot and thum.Health > 0 then
+            return currentTarget
+        end
+    end
+
+    local bestMob = nil
+    local minDistance = math.huge
+    local allMobs = GetAliveCakeMobs()
+
+    for _, mob in ipairs(allMobs) do
+        local mroot = mob:FindFirstChild("HumanoidRootPart")
+        if mroot then
+            local dist = (mroot.Position - myRoot.Position).Magnitude
+            if dist < minDistance then
+                minDistance = dist
+                bestMob = mob
+            end
+        end
+    end
+
+    currentTarget = bestMob
+    if bestMob and bestMob:FindFirstChild("HumanoidRootPart") then
+        clusterAnchor = bestMob.HumanoidRootPart.Position
+    else
+        clusterAnchor = nil
+    end
+
+    return currentTarget
+end
+
+local function BringSurroundingMobs(anchorPos)
+    if not anchorPos or tick() - lastBringTick < 0.15 then return end
+    lastBringTick = tick()
+    SafeSetSimRadius()
+
+    local mobs = GetAliveCakeMobs()
+    for _, mob in ipairs(mobs) do
+        local hum = mob:FindFirstChildOfClass("Humanoid")
+        local root = mob:FindFirstChild("HumanoidRootPart")
+        if hum and root then
+            local dist = (root.Position - anchorPos).Magnitude
+            if dist <= 280 then
+                pcall(function()
+                    for _, child in ipairs(mob:GetChildren()) do
+                        if child:IsA("Tool") then
+                            child:Destroy()
+                        end
+                    end
+                    local animator = hum:FindFirstChildOfClass("Animator")
+                    if animator then
+                        for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+                            track:Stop()
+                        end
+                    end
+                    hum.WalkSpeed = 0
+                    hum.JumpPower = 0
+                    hum.AutoRotate = false
+                    hum:ChangeState(Enum.HumanoidStateType.Physics)
+                    root.CanCollide = false
+                    root.AssemblyLinearVelocity = Vector3.zero
+                    root.AssemblyAngularVelocity = Vector3.zero
+                    root.CFrame = CFrame.new(anchorPos)
+                end)
+            end
+        end
+    end
+end
+
+local function StandardAutoClick()
+    pcall(function()
+        VirtualUser:CaptureController()
+        VirtualUser:Button1Down(Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2))
+        local char = LocalPlayer.Character
+        if char then
+            local tool = char:FindFirstChildOfClass("Tool")
+            if tool then
+                tool:Activate()
+            end
+        end
+    end)
+
+    pcall(function()
+        local net = ReplicatedStorage:FindFirstChild("Modules") and ReplicatedStorage.Modules:FindFirstChild("Net")
+        if net then
+            local regAtk = net:FindFirstChild("RE/RegisterAttack")
+            local regHit = net:FindFirstChild("RE/RegisterHit")
+            if regAtk and regHit and currentTarget then
+                local troot = currentTarget:FindFirstChild("HumanoidRootPart")
+                local thead = currentTarget:FindFirstChild("Head") or troot
+                if troot then
+                    regAtk:FireServer(0)
+                    regHit:FireServer(thead, {{currentTarget, thead}})
+                end
+            end
+        end
+    end)
+end
+
+local function CleanFlight()
+    if bv then bv:Destroy() bv = nil end
+    if bg then bg:Destroy() bg = nil end
+end
+
+local function InitFlight(root)
+    CleanFlight()
+    bv = Instance.new("BodyVelocity")
+    bv.Name = "MzherStableBV"
+    bv.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+    bv.Velocity = Vector3.zero
+    bv.Parent = root
+
+    bg = Instance.new("BodyGyro")
+    bg.Name = "MzherStableBG"
+    bg.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
+    bg.P = 4e4
+    bg.D = 1200
+    bg.CFrame = root.CFrame
+    bg.Parent = root
+end
+
+local function MoveUprightStable(root, targetPos, lookAtPos)
+    if not bv or not bv.Parent or not bg or not bg.Parent then
+        InitFlight(root)
+    end
+
+    local diff = targetPos - root.Position
+    local dist = diff.Magnitude
+
+    if dist > 3 then
+        bv.Velocity = diff.Unit * FlySpeed
+    else
+        bv.Velocity = Vector3.zero
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+    end
+
+    local flatForward = Vector3.new(lookAtPos.X - root.Position.X, 0, lookAtPos.Z - root.Position.Z)
+    if flatForward.Magnitude > 0.1 then
+        bg.CFrame = CFrame.lookAt(root.Position, root.Position + flatForward.Unit, Vector3.new(0, 1, 0))
+    else
+        bg.CFrame = CFrame.new(root.Position, root.Position + root.CFrame.LookVector)
+    end
+end
+
+local function StopFarm()
+    FarmEnabled = false
+    if farmLoop then farmLoop:Disconnect() farmLoop = nil end
+    if noclipLoop then noclipLoop:Disconnect() noclipLoop = nil end
+    if attackLoop then attackLoop:Disconnect() attackLoop = nil end
+    CleanFlight()
+
+    local char = LocalPlayer.Character
+    if char then
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        local root = char:FindFirstChild("HumanoidRootPart")
+        if hum then
+            hum.PlatformStand = false
+            hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+        end
+        if root then
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+        end
+        for _, part in ipairs(char:GetDescendants()) do
+            if part:IsA("BasePart") then
+                part.CanCollide = true
+            end
+        end
+    end
+
+    currentEquippedType = ""
+    currentTarget = nil
+    clusterAnchor = nil
+
+    if toggleBtn and toggleBtn.Parent then
+        toggleBtn.Text = "開始刷精通"
+        toggleBtn.BackgroundColor3 = Color3.fromRGB(220, 50, 50)
+    end
+    if statusLabel and statusLabel.Parent then
+        statusLabel.Text = "狀態: 已待機"
+    end
+end
+
+local function StartFarm()
+    local char = LocalPlayer.Character
+    if not char then return end
+    local root = char:FindFirstChild("HumanoidRootPart")
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not root or not hum then return end
+
+    if farmLoop then farmLoop:Disconnect() farmLoop = nil end
+    if noclipLoop then noclipLoop:Disconnect() noclipLoop = nil end
+    if attackLoop then attackLoop:Disconnect() attackLoop = nil end
+
+    FarmEnabled = true
+    currentEquippedType = ""
+    InitFlight(root)
+
+    if toggleBtn and toggleBtn.Parent then
+        toggleBtn.Text = "停止刷精通"
+        toggleBtn.BackgroundColor3 = Color3.fromRGB(40, 190, 80)
+    end
+
+    noclipLoop = RunService.Stepped:Connect(function()
+        if not FarmEnabled then return end
+        local c = LocalPlayer.Character
+        if c then
+            for _, part in ipairs(c:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    part.CanCollide = false
+                end
+            end
+            local h = c:FindFirstChildOfClass("Humanoid")
+            if h then
+                h.PlatformStand = false
+                h:ChangeState(Enum.HumanoidStateType.Physics)
+            end
+        end
+    end)
+
+    attackLoop = RunService.Heartbeat:Connect(function()
+        if not FarmEnabled then return end
+        local target = SelectTarget()
+        if not target then return end
+
+        local mHum = target:FindFirstChildOfClass("Humanoid")
+        local mRoot = target:FindFirstChild("HumanoidRootPart")
+        local c = LocalPlayer.Character
+        local myRoot = c and c:FindFirstChild("HumanoidRootPart")
+        if not mHum or not mRoot or not myRoot or mHum.Health <= 0 then return end
+
+        local ratio = mHum.Health / math.max(mHum.MaxHealth, 1)
+
+        if ratio > LowHPRatio then
+            SmartEquip("Melee", nil)
+            if tick() - lastAttackTick >= 0.22 then
+                lastAttackTick = tick()
+                StandardAutoClick()
+            end
+        else
+            SmartEquip("Blox Fruit", "Mammoth")
+            if tick() - lastSkillTick >= 0.45 then
+                lastSkillTick = tick()
+                Camera.CFrame = CFrame.lookAt(Camera.CFrame.Position, mRoot.Position)
+                SendKeyDirect(skillCycle[skillIndex])
+                skillIndex = (skillIndex % #skillCycle) + 1
+            end
+        end
+    end)
+
+    farmLoop = RunService.RenderStepped:Connect(function()
+        if not FarmEnabled then return end
+        local c = LocalPlayer.Character
+        if not c then return end
+        local myRoot = c:FindFirstChild("HumanoidRootPart")
+        local myHum = c:FindFirstChildOfClass("Humanoid")
+        if not myRoot or not myHum or myHum.Health <= 0 then return end
+
+        EnableBuso()
+
+        local target = SelectTarget()
+        if target then
+            local mHum = target:FindFirstChildOfClass("Humanoid")
+            local mRoot = target:FindFirstChild("HumanoidRootPart")
+            if mHum and mRoot and mHum.Health > 0 then
+                local anchor = clusterAnchor or mRoot.Position
+                BringSurroundingMobs(anchor)
+
+                local ratio = mHum.Health / math.max(mHum.MaxHealth, 1)
+                local safeHoverPos = anchor + Vector3.new(0, HoverDistanceUp, HoverDistanceBack)
+
+                if statusLabel then
+                    if ratio > LowHPRatio then
+                        statusLabel.Text = string.format("狀態: 聚怪拳法穩定削血 (%d%%)", math.floor(ratio * 100))
+                    else
+                        statusLabel.Text = string.format("狀態: 果實精準釋放技能 (%d%%)", math.floor(ratio * 100))
+                    end
+                end
+
+                MoveUprightStable(myRoot, safeHoverPos, anchor)
+            end
+        else
+            if statusLabel then
+                statusLabel.Text = "狀態: 巡邏尋找蛋糕島小怪..."
+            end
+            local pt = CakePatrolPoints[patrolIndex]
+            MoveUprightStable(myRoot, pt, pt + Vector3.new(0, 0, 10))
+            if (myRoot.Position - pt).Magnitude < 15 then
+                patrolIndex = (patrolIndex % #CakePatrolPoints) + 1
+            end
+        end
+    end)
+end
+
+charAddedConn = LocalPlayer.CharacterAdded:Connect(function(newChar)
+    currentTarget = nil
+    clusterAnchor = nil
+    currentEquippedType = ""
+    newChar:WaitForChild("HumanoidRootPart", 15)
+    newChar:WaitForChild("Humanoid", 15)
+    task.wait(0.6)
+    if FarmEnabled then
+        StartFarm()
+    end
+end)
+
+local function ToggleUIVisibility()
+    UIVisible = not UIVisible
+    if mainFrame then
+        mainFrame.Visible = UIVisible
+    end
+end
+
+keyConn = UserInputService.InputBegan:Connect(function(input, gpe)
+    if not gpe and input.KeyCode == Enum.KeyCode.M then
+        ToggleUIVisibility()
+    end
+end)
+
+local function BuildUI()
+    local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+    if playerGui:FindFirstChild("MzherMasteryEngine") then
+        playerGui.MzherMasteryEngine:Destroy()
+    end
+
+    screenGui = Instance.new("ScreenGui")
+    screenGui.Name = "MzherMasteryEngine"
+    screenGui.ResetOnSpawn = false
+    screenGui.Parent = playerGui
+
+    mFloatBtn = Instance.new("TextButton")
+    mFloatBtn.Size = UDim2.new(0, 38, 0, 38)
+    mFloatBtn.Position = UDim2.new(0.02, 0, 0.45, 0)
+    mFloatBtn.BackgroundColor3 = Color3.fromRGB(20, 20, 28)
+    mFloatBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    mFloatBtn.TextSize = 15
+    mFloatBtn.Font = Enum.Font.GothamBlack
+    mFloatBtn.Text = "M"
+    mFloatBtn.Active = true
+    mFloatBtn.Draggable = true
+    mFloatBtn.Parent = screenGui
+
+    local mCorner = Instance.new("UICorner")
+    mCorner.CornerRadius = UDim.new(1, 0)
+    mCorner.Parent = mFloatBtn
+
+    local mStroke = Instance.new("UIStroke")
+    mStroke.Thickness = 2
+    mStroke.Color = Color3.fromRGB(80, 140, 255)
+    mStroke.Parent = mFloatBtn
+
+    mFloatBtn.MouseButton1Click:Connect(ToggleUIVisibility)
+
+    mainFrame = Instance.new("Frame")
+    mainFrame.Size = UDim2.new(0, 250, 0, 145)
+    mainFrame.Position = UDim2.new(0.12, 0, 0.35, 0)
+    mainFrame.BackgroundColor3 = Color3.fromRGB(15, 15, 22)
+    mainFrame.Active = true
+    mainFrame.Draggable = true
+    mainFrame.BorderSizePixel = 0
+    mainFrame.Parent = screenGui
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 12)
+    corner.Parent = mainFrame
+
+    uiStroke = Instance.new("UIStroke")
+    uiStroke.Thickness = 2.5
+    uiStroke.Parent = mainFrame
+
+    local hue = 0
+    rainbowConn = RunService.RenderStepped:Connect(function(dt)
+        hue = (hue + dt * 0.25) % 1
+        local col = Color3.fromHSV(hue, 0.8, 1)
+        uiStroke.Color = col
+        mStroke.Color = col
+    end)
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -55, 0, 32)
+    title.Position = UDim2.new(0, 14, 0, 4)
+    title.BackgroundTransparency = 1
+    title.TextColor3 = Color3.fromRGB(255, 255, 255)
+    title.TextSize = 14
+    title.Font = Enum.Font.GothamBlack
+    title.Text = "mzher 猛獁象精通 (M鍵)"
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Parent = mainFrame
+
+    local exitBtn = Instance.new("TextButton")
+    exitBtn.Size = UDim2.new(0, 24, 0, 24)
+    exitBtn.Position = UDim2.new(1, -30, 0, 8)
+    exitBtn.BackgroundColor3 = Color3.fromRGB(230, 45, 45)
+    exitBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    exitBtn.TextSize = 14
+    exitBtn.Font = Enum.Font.GothamBlack
+    exitBtn.Text = "✕"
+    exitBtn.Parent = mainFrame
+
+    local exitCorner = Instance.new("UICorner")
+    exitCorner.CornerRadius = UDim.new(0, 6)
+    exitCorner.Parent = exitBtn
+
+    exitBtn.MouseButton1Click:Connect(function()
+        StopFarm()
+        if rainbowConn then rainbowConn:Disconnect() rainbowConn = nil end
+        if charAddedConn then charAddedConn:Disconnect() charAddedConn = nil end
+        if keyConn then keyConn:Disconnect() keyConn = nil end
+        screenGui:Destroy()
+    end)
+
+    statusLabel = Instance.new("TextLabel")
+    statusLabel.Size = UDim2.new(1, -28, 0, 22)
+    statusLabel.Position = UDim2.new(0, 14, 0, 36)
+    statusLabel.BackgroundTransparency = 1
+    statusLabel.TextColor3 = Color3.fromRGB(160, 200, 255)
+    statusLabel.TextSize = 12
+    statusLabel.Font = Enum.Font.GothamBold
+    statusLabel.Text = "狀態: 已待機 (飛行固定 220)"
+    statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+    statusLabel.Parent = mainFrame
+
+    local hpLabel = Instance.new("TextLabel")
+    hpLabel.Size = UDim2.new(0, 75, 0, 36)
+    hpLabel.Position = UDim2.new(0, 14, 0, 64)
+    hpLabel.BackgroundTransparency = 1
+    hpLabel.TextColor3 = Color3.fromRGB(220, 220, 220)
+    hpLabel.TextSize = 12
+    hpLabel.Font = Enum.Font.GothamBold
+    hpLabel.Text = "果實尾刀%:"
+    hpLabel.TextXAlignment = Enum.TextXAlignment.Left
+    hpLabel.Parent = mainFrame
+
+    hpBox = Instance.new("TextBox")
+    hpBox.Size = UDim2.new(0, 45, 0, 32)
+    hpBox.Position = UDim2.new(0, 86, 0, 66)
+    hpBox.BackgroundColor3 = Color3.fromRGB(26, 26, 36)
+    hpBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+    hpBox.TextSize = 13
+    hpBox.Font = Enum.Font.GothamBlack
+    hpBox.Text = "20"
+    hpBox.Parent = mainFrame
+
+    local hpCorner = Instance.new("UICorner")
+    hpCorner.CornerRadius = UDim.new(0, 6)
+    hpCorner.Parent = hpBox
+
+    hpBox.FocusLost:Connect(function()
+        local val = tonumber(hpBox.Text)
+        if val then
+            val = math.clamp(val, 5, 90)
+            LowHPRatio = val / 100
+            hpBox.Text = tostring(val)
+        else
+            hpBox.Text = tostring(math.floor(LowHPRatio * 100))
+        end
+    end)
+
+    toggleBtn = Instance.new("TextButton")
+    toggleBtn.Size = UDim2.new(0, 98, 0, 36)
+    toggleBtn.Position = UDim2.new(0, 138, 0, 64)
+    toggleBtn.BackgroundColor3 = Color3.fromRGB(220, 50, 50)
+    toggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    toggleBtn.TextSize = 13
+    toggleBtn.Font = Enum.Font.GothamBlack
+    toggleBtn.Text = "開始刷精通"
+    toggleBtn.Parent = mainFrame
+
+    local tCorner = Instance.new("UICorner")
+    tCorner.CornerRadius = UDim.new(0, 8)
+    tCorner.Parent = toggleBtn
+
+    toggleBtn.MouseButton1Click:Connect(function()
+        if FarmEnabled then
+            StopFarm()
+        else
+            StartFarm()
+        end
+    end)
+
+    local noteLabel = Instance.new("TextLabel")
+    noteLabel.Size = UDim2.new(1, -28, 0, 24)
+    noteLabel.Position = UDim2.new(0, 14, 0, 110)
+    noteLabel.BackgroundTransparency = 1
+    noteLabel.TextColor3 = Color3.fromRGB(130, 130, 150)
+    noteLabel.TextSize = 11
+    noteLabel.Font = Enum.Font.GothamBold
+    noteLabel.Text = "安全懸停 | 正立防顛倒 | 聚怪尾刀"
+    noteLabel.TextXAlignment = Enum.TextXAlignment.Left
+    noteLabel.Parent = mainFrame
+end
+
+BuildUI()
